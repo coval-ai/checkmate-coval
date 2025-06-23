@@ -38,6 +38,11 @@ class SimpleCheckmateSimulation:
         Run a simple simulation using CheckmateModelManager
         """
         logger.info("Starting Checkmate simulation...")
+        logger.info(f"Simulation parameters: objective='{user_objective}', duration={duration_minutes} minutes")
+
+        # Validate duration parameter
+        if duration_minutes < 1 or duration_minutes > 60:
+            logger.warning(f"Duration {duration_minutes} minutes is outside recommended range (1-60). Using default behavior.")
 
         # Validate required environment variables
         required_vars = [
@@ -71,10 +76,13 @@ class SimpleCheckmateSimulation:
 
             # Run the simulation
             logger.info(f"Running simulation with objective: {user_objective}")
+            # Note: duration_minutes is not currently used by CheckmateModelManager
+            # The manager uses a turn-based limit (20 turns) instead of time-based limit
             message_history = manager.run_simulation(user_objective)
 
             if message_history:
                 self.transcript = message_history
+                self.simulation_complete = True
                 logger.info(f"Simulation completed successfully with {len(message_history)} messages")
             else:
                 logger.error("Simulation failed - no message history returned")
@@ -121,23 +129,30 @@ class SimpleCheckmateSimulation:
         logger.info(f"Summary saved to: {summary_file}")
 
 
-def main():
+def main(objective=None, duration_minutes=None, websocket_endpoint=None, simulation_prompt=None):
     """Main entry point for the simulation"""
     simulation = SimpleCheckmateSimulation()
 
-    # Get websocket endpoint from environment or use default
-    websocket_endpoint = os.getenv("WEBSOCKET_ENDPOINT")
+    # Get websocket endpoint from environment or use provided parameter
+    if not websocket_endpoint:
+        websocket_endpoint = os.getenv("WEBSOCKET_ENDPOINT")
+    
     if not websocket_endpoint:
         logger.error("WEBSOCKET_ENDPOINT environment variable is required")
         logger.info("Example: WEBSOCKET_ENDPOINT=wss://your-checkmate-server.com/ws")
         return
 
-    # Run simulation with custom parameters
+    # Use provided parameters or defaults
+    user_objective = objective or "I want a five dollar meal"
+    duration = duration_minutes or 5
+    prompt = simulation_prompt or "You are a customer at a fast food restaurant. Be natural and conversational."
+
+    # Run simulation with parameters
     transcript = simulation.run_simulation(
-        user_objective="I want a five dollar meal",
+        user_objective=user_objective,
         websocket_endpoint=websocket_endpoint,
-        simulation_prompt="You are a customer at a fast food restaurant. Be natural and conversational.",
-        duration_minutes=5,
+        simulation_prompt=prompt,
+        duration_minutes=duration,
     )
 
     # Save results
@@ -178,5 +193,10 @@ if __name__ == "__main__":
     if args.websocket_endpoint:
         os.environ["WEBSOCKET_ENDPOINT"] = args.websocket_endpoint
 
-    # Run the simulation
-    main()
+    # Run the simulation with parsed arguments
+    main(
+        objective=args.objective,
+        duration_minutes=args.duration,
+        websocket_endpoint=args.websocket_endpoint,
+        simulation_prompt=args.simulation_prompt
+    )
