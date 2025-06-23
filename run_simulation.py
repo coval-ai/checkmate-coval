@@ -134,9 +134,9 @@ def main():
 
     # Run simulation with custom parameters
     transcript = simulation.run_simulation(
-        user_objective="I want to schedule a job interview for a software engineering position",
+        user_objective="I want a five dollar meal",
         websocket_endpoint=websocket_endpoint,
-        simulation_prompt="You are a helpful assistant in a voice conversation. Be natural and conversational.",
+        simulation_prompt="You are a customer at a fast food restaurant. Be natural and conversational.",
         duration_minutes=5,
     )
 
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Checkmate Agent simulation")
     parser.add_argument(
         "--objective",
-        default="I want to schedule a meeting",
+        default="I want a five dollar meal",
         help="User objective for the simulation",
     )
     parser.add_argument(
