@@ -79,6 +79,15 @@ class CheckmateModelManager(ModelManager):
                 )
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Connected to websocket")
 
+                # Send initial handshake message
+                initial_message = {
+                    "event": "websocket:connected",
+                    "content-type": "audio/l8;rate=8000",
+                }
+                await self.websocket.send(json.dumps(initial_message))
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Sent initial handshake message")
+                await asyncio.sleep(1)  # Allow server to process handshake
+
             self.loop.run_until_complete(connect_websocket())
 
             if not self.websocket:
@@ -335,17 +344,38 @@ class CheckmateModelManager(ModelManager):
             message_history.append(user_response["message"])
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Added initial user message to history: '{user_response['message']['content']}'")
 
-            # Send initial user audio
+            # Send initial user audio in batches
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Converting initial user message to audio...")
             audio_chunks = self._tts(user_response["message"]["content"])
             if audio_chunks:
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending {len(audio_chunks)} audio chunks to websocket...")
-                for i, chunk in enumerate(audio_chunks):
-                    await self.websocket.send(chunk)
-                    await asyncio.sleep(0.02)  # 20ms delay between chunks
-                    if i % 50 == 0:  # Log every 50th chunk to avoid spam
-                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sent {i+1}/{len(audio_chunks)} audio chunks")
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: SUCCESS - Sent all initial user audio chunks")
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending {len(audio_chunks)} audio chunks to websocket in batches...")
+
+                # Send audio chunks in batches of 5 with responses in between
+                batch_size = 5
+                for i in range(0, len(audio_chunks), batch_size):
+                    batch_end = min(i + batch_size, len(audio_chunks))
+                    batch_chunks = audio_chunks[i:batch_end]
+
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending batch {i//batch_size + 1}/{(len(audio_chunks) + batch_size - 1)//batch_size} (chunks {i+1} to {batch_end})")
+
+                    # Send all chunks in this batch
+                    for j, chunk in enumerate(batch_chunks):
+                        await self.websocket.send(chunk)
+                        await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Batch {i//batch_size + 1} sent, waiting for response...")
+
+                    # Wait briefly for any response after the batch
+                    try:
+                        response_message = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Got intermediate response after batch {i//batch_size + 1}")
+                    except asyncio.TimeoutError:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: No response after batch {i//batch_size + 1}, continuing...")
+
+                    # Brief pause before next batch
+                    await asyncio.sleep(0.5)
+
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: SUCCESS - Sent all initial user audio chunks in {(len(audio_chunks) + batch_size - 1)//batch_size} batches")
             else:
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - No audio chunks generated for initial response")
 
@@ -395,13 +425,34 @@ class CheckmateModelManager(ModelManager):
                 audio_chunks = self._tts(user_response["message"]["content"])
                 
                 if audio_chunks:
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending {len(audio_chunks)} audio chunks to websocket...")
-                    for i, chunk in enumerate(audio_chunks):
-                        await self.websocket.send(chunk)
-                        await asyncio.sleep(0.02)  # 20ms delay between chunks
-                        if i % 50 == 0:  # Log every 50th chunk to avoid spam
-                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sent {i+1}/{len(audio_chunks)} audio chunks")
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: SUCCESS - Sent all user response audio chunks")
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending {len(audio_chunks)} audio chunks to websocket in batches...")
+
+                    # Send audio chunks in batches of 5 with responses in between
+                    batch_size = 5
+                    for i in range(0, len(audio_chunks), batch_size):
+                        batch_end = min(i + batch_size, len(audio_chunks))
+                        batch_chunks = audio_chunks[i:batch_end]
+
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Sending batch {i//batch_size + 1}/{(len(audio_chunks) + batch_size - 1)//batch_size} (chunks {i+1} to {batch_end})")
+
+                        # Send all chunks in this batch
+                        for j, chunk in enumerate(batch_chunks):
+                            await self.websocket.send(chunk)
+                            await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Batch {i//batch_size + 1} sent, waiting for response...")
+
+                        # Wait briefly for any response after the batch
+                        try:
+                            response_message = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Got intermediate response after batch {i//batch_size + 1}")
+                        except asyncio.TimeoutError:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: No response after batch {i//batch_size + 1}, continuing...")
+
+                        # Brief pause before next batch
+                        await asyncio.sleep(0.5)
+
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: SUCCESS - Sent all user response audio chunks in {(len(audio_chunks) + batch_size - 1)//batch_size} batches")
                 else:
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - No audio chunks generated for user response")
 
@@ -492,7 +543,12 @@ class CheckmateModelManager(ModelManager):
                                             # Convert audio to text using STT
                                             transcript = self._stt(audio_bytes)
                                             if transcript and transcript.strip():
-                                                message_history.append({"role": "assistant", "content": transcript})
+                                                message_history.append(
+                                                    {
+                                                        "role": "assistant",
+                                                        "content": transcript,
+                                                    }
+                                                )
                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Audio Response: '{transcript}'")
                                                 return transcript
                                             else:
@@ -532,15 +588,24 @@ class CheckmateModelManager(ModelManager):
                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Dialog item {i}: {dialog_item}")
                                             if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                 content = dialog_item["text"]
+                                                chrysalis = dialog_item.get("chrysalis")
                                                 if content and content.strip():
-                                                    message_history.append({"role": "assistant", "content": content})
+                                                    message_history.append(
+                                                        {
+                                                            "role": "assistant",
+                                                            "content": content,
+                                                            "cart": (chrysalis.get("order") if chrysalis else None),
+                                                        }
+                                                    )
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response: '{content}'")
                                                     return content
                                                 else:
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - AI dialog item has empty text")
                                             else:
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}")
-                                        
+                                                self._print_and_log(
+                                                    f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}"
+                                                )
+
                                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: INFO - Dialog found in double nested data but no AI messages with text")
                                     else:
                                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - No dialog array found in double nested data")
@@ -552,8 +617,15 @@ class CheckmateModelManager(ModelManager):
                                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Dialog item {i}: {dialog_item}")
                                         if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                             content = dialog_item["text"]
+                                            chrysalis = dialog_item.get("chrysalis")
                                             if content and content.strip():
-                                                message_history.append({"role": "assistant", "content": content})
+                                                message_history.append(
+                                                    {
+                                                        "role": "assistant",
+                                                        "content": content,
+                                                        "cart": (chrysalis.get("order") if chrysalis else None),
+                                                    }
+                                                )
                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response: '{content}'")
                                                 return content
                                             else:
@@ -574,7 +646,12 @@ class CheckmateModelManager(ModelManager):
                                     "cart": json_data["data"].get("cart", ""),
                                 }
                                 if simplified_data["items"] or simplified_data["cart"]:
-                                    message_history.append({"role": "system", "content": json.dumps(simplified_data)})
+                                    message_history.append(
+                                        {
+                                            "role": "system",
+                                            "content": json.dumps(simplified_data),
+                                        }
+                                    )
                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Data message received: {simplified_data}")
                                     return "Data received"
                                 else:
@@ -634,7 +711,12 @@ class CheckmateModelManager(ModelManager):
                                                 # Convert audio to text using STT
                                                 transcript = self._stt(audio_bytes)
                                                 if transcript and transcript.strip():
-                                                    message_history.append({"role": "assistant", "content": transcript})
+                                                    message_history.append(
+                                                        {
+                                                            "role": "assistant",
+                                                            "content": transcript,
+                                                        }
+                                                    )
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Audio Response: '{transcript}'")
                                                     return transcript
                                                 else:
@@ -670,8 +752,15 @@ class CheckmateModelManager(ModelManager):
                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - String JSON: Dialog item {i}: {dialog_item}")
                                                 if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                     content = dialog_item["text"]
+                                                    chrysalis = dialog_item.get("chrysalis")
                                                     if content and content.strip():
-                                                        message_history.append({"role": "assistant", "content": content})
+                                                        message_history.append(
+                                                            {
+                                                                "role": "assistant",
+                                                                "content": content,
+                                                                "cart": (chrysalis.get("order") if chrysalis else None),
+                                                            }
+                                                        )
                                                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response from string: '{content}'")
                                                         return content
                                         
@@ -684,8 +773,15 @@ class CheckmateModelManager(ModelManager):
                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - String JSON: Dialog item {i}: {dialog_item}")
                                             if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                 content = dialog_item["text"]
+                                                chrysalis = dialog_item.get("chrysalis")
                                                 if content and content.strip():
-                                                    message_history.append({"role": "assistant", "content": content})
+                                                    message_history.append(
+                                                        {
+                                                            "role": "assistant",
+                                                            "content": content,
+                                                            "cart": (chrysalis.get("order") if chrysalis else None),
+                                                        }
+                                                    )
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response from string: '{content}'")
                                                     return content
                         
@@ -754,8 +850,15 @@ class CheckmateModelManager(ModelManager):
                                                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item {i}: {dialog_item}")
                                                         if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                             content = dialog_item["text"]
+                                                            chrysalis = dialog_item.get("chrysalis")
                                                             if content and content.strip():
-                                                                message_history.append({"role": "assistant", "content": content})
+                                                                message_history.append(
+                                                                    {
+                                                                        "role": "assistant",
+                                                                        "content": content,
+                                                                        "cart": (chrysalis.get("order") if chrysalis else None),
+                                                                    }
+                                                                )
                                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response during audio: '{content}'")
                                                                 audio_state.agent_is_speaking = False
                                                                 return content
@@ -763,7 +866,6 @@ class CheckmateModelManager(ModelManager):
                                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: AI dialog item has empty text")
                                                         else:
                                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}")
-                                                    
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: INFO - Audio collection: Dialog found in double nested data but no AI messages with text")
                                                 else:
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in double nested data")
@@ -775,15 +877,24 @@ class CheckmateModelManager(ModelManager):
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item {i}: {dialog_item}")
                                                     if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                         content = dialog_item["text"]
+                                                        chrysalis = dialog_item.get("chrysalis")
                                                         if content and content.strip():
-                                                            message_history.append({"role": "assistant", "content": content})
+                                                            message_history.append(
+                                                                {
+                                                                    "role": "assistant",
+                                                                    "content": content,
+                                                                    "cart": (chrysalis.get("order") if chrysalis else None),
+                                                                }
+                                                            )
                                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response during audio: '{content}'")
                                                             audio_state.agent_is_speaking = False
                                                             return content
                                                         else:
                                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: AI dialog item has empty text")
                                                     else:
-                                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}")
+                                                        self._print_and_log(
+                                                            f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}"
+                                                        )
                                             else:
                                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in nested data")
                                         else:
