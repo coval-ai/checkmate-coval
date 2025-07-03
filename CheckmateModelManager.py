@@ -51,17 +51,35 @@ class CheckmateModelManager(ModelManager):
         self.deepgram_client = DeepgramClient(self.deepgram_api_key)
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self.keepalive_task = None
     
     async def _keep_websocket_alive(self, ws, interval=15):
         while True:
             try:
                 pong_waiter = await ws.ping()
                 await asyncio.wait_for(pong_waiter, timeout=10)
+            except websockets.exceptions.ConnectionClosedError as e:
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: ERROR - WebSocket connection closed error: {e}")
+                try:
+                    await ws.close()
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: SUCCESS - WebSocket connection closed")
+                except Exception as close_error:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: WARNING - Error closing websocket: {close_error}")
+                return  # Exit the keepalive loop
+            except websockets.exceptions.ConnectionClosed as e:
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: ERROR - WebSocket connection closed: {e}")
+                return  # Exit the keepalive loop
+            except asyncio.TimeoutError as e:
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: WARNING - Ping timeout: {e}")
+                # Continue trying, don't close the connection for timeout
             except Exception as e:
-                self._print_and_log(f"Keepalive failed: {e}")
-                await ws.close()
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] WebSocket connection closed")
-                raise e
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: ERROR - Unexpected error: {e}")
+                try:
+                    await ws.close()
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: SUCCESS - WebSocket connection closed due to error")
+                except Exception as close_error:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: WARNING - Error closing websocket: {close_error}")
+                return  # Exit the keepalive loop
             await asyncio.sleep(interval)
 
     def _start(self, config):
@@ -99,7 +117,10 @@ class CheckmateModelManager(ModelManager):
                 await self.websocket.send(json.dumps(initial_message))
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Sent initial handshake message")
                 await asyncio.sleep(1)  # Allow server to process handshake
-                asyncio.create_task(self._keep_websocket_alive(self.websocket))
+                
+                # Start keepalive task and store reference for cleanup
+                self.keepalive_task = asyncio.create_task(self._keep_websocket_alive(self.websocket))
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Started keepalive task")
 
             self.loop.run_until_complete(connect_websocket())
 
@@ -373,17 +394,36 @@ class CheckmateModelManager(ModelManager):
 
                     # Send all chunks in this batch
                     for j, chunk in enumerate(batch_chunks):
-                        await self.websocket.send(chunk)
-                        await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+                        try:
+                            await self.websocket.send(chunk)
+                            await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+                        except websockets.exceptions.ConnectionClosedError as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
+                            # Try to reconnect or handle gracefully
+                            raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                        except Exception as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: ERROR - Failed to send audio chunk {j+1}: {e}")
+                            raise SimulationAPIError(f"Failed to send audio chunk: {e}")
 
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Batch {i//batch_size + 1} sent, waiting for response...")
 
                     # Wait briefly for any response after the batch
                     try:
                         response_message = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE RESPONSE - Type: {type(response_message).__name__}, Size: {len(response_message) if hasattr(response_message, '__len__') else 'N/A'}")
+                        if isinstance(response_message, str):
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE STRING - Content: '{response_message[:300]}...'")
+                        elif isinstance(response_message, bytes):
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE BYTES - First 30 bytes: {response_message[:30]}")
                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Got intermediate response after batch {i//batch_size + 1}")
                     except asyncio.TimeoutError:
                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: No response after batch {i//batch_size + 1}, continuing...")
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while waiting for intermediate response: {e}")
+                        raise SimulationAPIError(f"WebSocket connection closed during conversation: {e}")
+                    except websockets.exceptions.ConnectionClosed as e:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while waiting for intermediate response: {e}")
+                        raise SimulationAPIError(f"WebSocket connection closed during conversation: {e}")
 
                     # Brief pause before next batch
                     await asyncio.sleep(0.5)
@@ -450,17 +490,36 @@ class CheckmateModelManager(ModelManager):
 
                         # Send all chunks in this batch
                         for j, chunk in enumerate(batch_chunks):
-                            await self.websocket.send(chunk)
-                            await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+                            try:
+                                await self.websocket.send(chunk)
+                                await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
+                            except websockets.exceptions.ConnectionClosedError as e:
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
+                                # Try to reconnect or handle gracefully
+                                raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                            except Exception as e:
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: ERROR - Failed to send audio chunk {j+1}: {e}")
+                                raise SimulationAPIError(f"Failed to send audio chunk: {e}")
 
                         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Batch {i//batch_size + 1} sent, waiting for response...")
 
                         # Wait briefly for any response after the batch
                         try:
                             response_message = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE RESPONSE - Type: {type(response_message).__name__}, Size: {len(response_message) if hasattr(response_message, '__len__') else 'N/A'}")
+                            if isinstance(response_message, str):
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE STRING - Content: '{response_message[:300]}...'")
+                            elif isinstance(response_message, bytes):
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INTERMEDIATE BYTES - First 30 bytes: {response_message[:30]}")
                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: Got intermediate response after batch {i//batch_size + 1}")
                         except asyncio.TimeoutError:
                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: No response after batch {i//batch_size + 1}, continuing...")
+                        except websockets.exceptions.ConnectionClosedError as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while waiting for intermediate response: {e}")
+                            raise SimulationAPIError(f"WebSocket connection closed during conversation: {e}")
+                        except websockets.exceptions.ConnectionClosed as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while waiting for intermediate response: {e}")
+                            raise SimulationAPIError(f"WebSocket connection closed during conversation: {e}")
 
                         # Brief pause before next batch
                         await asyncio.sleep(0.5)
@@ -503,10 +562,21 @@ class CheckmateModelManager(ModelManager):
                 # Wait for agent response with shorter timeout
                 try:
                     response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED DATA - Type: {type(response).__name__}, Size: {len(response) if hasattr(response, '__len__') else 'N/A'}")
+                    if isinstance(response, str):
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED STRING - Content: '{response[:500]}...'")
+                    elif isinstance(response, bytes):
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED BYTES - First 50 bytes: {response[:50]}")
                 except asyncio.TimeoutError:
                     silence_count += 1
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Silence timeout {silence_count}, elapsed: {elapsed_time:.1f}s")
                     continue
+                except websockets.exceptions.ConnectionClosedError as e:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during receive: {e}")
+                    return None
+                except websockets.exceptions.ConnectionClosed as e:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during receive: {e}")
+                    return None
                 
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Received response type: {type(response).__name__}, size: {len(response) if hasattr(response, '__len__') else 'N/A'}")
 
@@ -824,6 +894,19 @@ class CheckmateModelManager(ModelManager):
                     while silence_count < max_silence_count:
                         try:
                             chunk = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK - Type: {type(chunk).__name__}, Size: {len(chunk) if hasattr(chunk, '__len__') else 'N/A'}")
+                            if isinstance(chunk, str):
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK STRING - Content: '{chunk[:200]}...'")
+                            elif isinstance(chunk, bytes):
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK BYTES - First 20 bytes: {chunk[:20]}")
+                        except websockets.exceptions.ConnectionClosedError as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during audio collection: {e}")
+                            audio_state.agent_is_speaking = False
+                            return None
+                        except websockets.exceptions.ConnectionClosed as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during audio collection: {e}")
+                            audio_state.agent_is_speaking = False
+                            return None
                             if isinstance(chunk, bytes):
                                 buffer += chunk
                                 chunk_count += 1
@@ -960,6 +1043,9 @@ class CheckmateModelManager(ModelManager):
         except websockets.exceptions.ConnectionClosed:
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed")
             return None
+        except websockets.exceptions.ConnectionClosedError as e:
+            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed error: {e}")
+            return None
         except Exception as e:
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - Error receiving agent response: {e}")
             return None
@@ -1027,11 +1113,31 @@ class CheckmateModelManager(ModelManager):
         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Starting resource cleanup")
         
         try:
+            # Cancel keepalive task first
+            if self.keepalive_task and not self.keepalive_task.done():
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Cancelling keepalive task...")
+                try:
+                    self.keepalive_task.cancel()
+                    if not self.loop.is_closed():
+                        self.loop.run_until_complete(asyncio.gather(self.keepalive_task, return_exceptions=True))
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - Keepalive task cancelled")
+                except Exception as e:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - Error cancelling keepalive task: {e}")
+            else:
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: No keepalive task to cancel")
+            
             if self.websocket:
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Closing websocket connection...")
                 if not self.loop.is_closed():
-                    self.loop.run_until_complete(self.websocket.close())
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - Websocket closed")
+                    try:
+                        self.loop.run_until_complete(self.websocket.close())
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - Websocket closed")
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - WebSocket already closed: {e}")
+                    except websockets.exceptions.ConnectionClosed as e:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - WebSocket already closed: {e}")
+                    except Exception as e:
+                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - Error closing websocket: {e}")
                 else:
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - Event loop already closed, cannot close websocket")
             else:
@@ -1048,5 +1154,6 @@ class CheckmateModelManager(ModelManager):
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: No event loop to close or already closed")
             
             self.websocket = None
+            self.keepalive_task = None
             self.loop = None
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - All resources cleaned up")
