@@ -51,6 +51,18 @@ class CheckmateModelManager(ModelManager):
         self.deepgram_client = DeepgramClient(self.deepgram_api_key)
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+    
+    async def _keep_websocket_alive(self, ws, interval=15):
+        while True:
+            try:
+                pong_waiter = await ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=10)
+            except Exception as e:
+                self._print_and_log(f"Keepalive failed: {e}")
+                await ws.close()
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] WebSocket connection closed")
+                raise e
+            await asyncio.sleep(interval)
 
     def _start(self, config):
         """Initialize the Checkmate manager and OpenAI client"""
@@ -73,8 +85,8 @@ class CheckmateModelManager(ModelManager):
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] Attempting websocket connection...")
                 self.websocket = await websockets.connect(
                     self.websocket_endpoint,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=None,
+                    ping_timeout=None,
                     close_timeout=10,
                 )
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Connected to websocket")
@@ -87,6 +99,7 @@ class CheckmateModelManager(ModelManager):
                 await self.websocket.send(json.dumps(initial_message))
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Sent initial handshake message")
                 await asyncio.sleep(1)  # Allow server to process handshake
+                asyncio.create_task(self._keep_websocket_alive(self.websocket))
 
             self.loop.run_until_complete(connect_websocket())
 
