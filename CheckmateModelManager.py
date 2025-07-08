@@ -51,13 +51,15 @@ class CheckmateModelManager(ModelManager):
         self.deepgram_client = DeepgramClient(self.deepgram_api_key)
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.keepalive_task = None
     
     async def _keep_websocket_alive(self, ws, interval=15):
         while True:
             try:
                 pong_waiter = await ws.ping()
                 await asyncio.wait_for(pong_waiter, timeout=10)
+            except asyncio.CancelledError:
+                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: Task cancelled, exiting gracefully")
+                return  # Exit gracefully when cancelled
             except websockets.exceptions.ConnectionClosedError as e:
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] KEEPALIVE: ERROR - WebSocket connection closed error: {e}")
                 try:
@@ -117,10 +119,7 @@ class CheckmateModelManager(ModelManager):
                 await self.websocket.send(json.dumps(initial_message))
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Sent initial handshake message")
                 await asyncio.sleep(1)  # Allow server to process handshake
-                
-                # Start keepalive task and store reference for cleanup
-                self.keepalive_task = asyncio.create_task(self._keep_websocket_alive(self.websocket))
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] SUCCESS: Started keepalive task")
+                asyncio.create_task(self._keep_websocket_alive(self.websocket))
 
             self.loop.run_until_complete(connect_websocket())
 
@@ -398,9 +397,17 @@ class CheckmateModelManager(ModelManager):
                             await self.websocket.send(chunk)
                             await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
                         except websockets.exceptions.ConnectionClosedError as e:
-                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
-                            # Try to reconnect or handle gracefully
-                            raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                            if "1000 (OK)" in str(e):
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INFO - WebSocket connection closed with code 1000 (OK) while sending audio chunk {j+1}: {e}")
+                                # Don't return, just continue - this is normal behavior
+                                break
+                            else:
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
+                                raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                        except websockets.exceptions.ConnectionClosedOK as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INFO - WebSocket connection closed normally while sending audio chunk {j+1}: {e}")
+                            # Don't return, just continue - this is normal behavior
+                            break
                         except Exception as e:
                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: ERROR - Failed to send audio chunk {j+1}: {e}")
                             raise SimulationAPIError(f"Failed to send audio chunk: {e}")
@@ -432,12 +439,24 @@ class CheckmateModelManager(ModelManager):
             else:
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - No audio chunks generated for initial response")
 
-            # Main conversation loop with maximum turns
+            # Main conversation loop with maximum turns and 5-minute timeout
             conversation_ended = False
             turn_count = 0
             max_turns = 20  # Prevent infinite loops
+            conversation_start_time = asyncio.get_event_loop().time()
+            max_conversation_time = 300  # 5 minutes timeout
             
             while not conversation_ended and turn_count < max_turns:
+                # Check 5-minute timeout
+                elapsed_time = asyncio.get_event_loop().time() - conversation_start_time
+                if elapsed_time > max_conversation_time:
+                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - Reached 5-minute timeout, ending conversation")
+                    message_history.append({
+                        "role": "system", 
+                        "content": f"Conversation ended after {elapsed_time:.1f} seconds due to 5-minute timeout"
+                    })
+                    break
+                
                 turn_count += 1
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: === TURN {turn_count}/{max_turns} ===")
                 
@@ -494,9 +513,17 @@ class CheckmateModelManager(ModelManager):
                                 await self.websocket.send(chunk)
                                 await asyncio.sleep(0.1)  # 100ms delay between chunks (like in websocket_test2.py)
                             except websockets.exceptions.ConnectionClosedError as e:
-                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
-                                # Try to reconnect or handle gracefully
-                                raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                                if "1000 (OK)" in str(e):
+                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INFO - WebSocket connection closed with code 1000 (OK) while sending audio chunk {j+1}: {e}")
+                                    # Don't return, just continue - this is normal behavior
+                                    break
+                                else:
+                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: WARNING - WebSocket connection closed while sending audio chunk {j+1}: {e}")
+                                    raise SimulationAPIError(f"WebSocket connection closed during audio transmission: {e}")
+                            except websockets.exceptions.ConnectionClosedOK as e:
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: INFO - WebSocket connection closed normally while sending audio chunk {j+1}: {e}")
+                                # Don't return, just continue - this is normal behavior
+                                break
                             except Exception as e:
                                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CONVERSATION: ERROR - Failed to send audio chunk {j+1}: {e}")
                                 raise SimulationAPIError(f"Failed to send audio chunk: {e}")
@@ -562,11 +589,6 @@ class CheckmateModelManager(ModelManager):
                 # Wait for agent response with shorter timeout
                 try:
                     response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED DATA - Type: {type(response).__name__}, Size: {len(response) if hasattr(response, '__len__') else 'N/A'}")
-                    if isinstance(response, str):
-                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED STRING - Content: '{response[:500]}...'")
-                    elif isinstance(response, bytes):
-                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: RECEIVED BYTES - First 50 bytes: {response[:50]}")
                 except asyncio.TimeoutError:
                     silence_count += 1
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Silence timeout {silence_count}, elapsed: {elapsed_time:.1f}s")
@@ -894,11 +916,6 @@ class CheckmateModelManager(ModelManager):
                     while silence_count < max_silence_count:
                         try:
                             chunk = await asyncio.wait_for(self.websocket.recv(), timeout=1.0)
-                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK - Type: {type(chunk).__name__}, Size: {len(chunk) if hasattr(chunk, '__len__') else 'N/A'}")
-                            if isinstance(chunk, str):
-                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK STRING - Content: '{chunk[:200]}...'")
-                            elif isinstance(chunk, bytes):
-                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: AUDIO CHUNK BYTES - First 20 bytes: {chunk[:20]}")
                         except websockets.exceptions.ConnectionClosedError as e:
                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during audio collection: {e}")
                             audio_state.agent_is_speaking = False
@@ -907,69 +924,51 @@ class CheckmateModelManager(ModelManager):
                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - WebSocket connection closed during audio collection: {e}")
                             audio_state.agent_is_speaking = False
                             return None
-                            if isinstance(chunk, bytes):
-                                buffer += chunk
-                                chunk_count += 1
-                                silence_count = 0  # Reset silence counter
-                                if chunk_count % 10 == 0:  # Log every 10th chunk
-                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Received {chunk_count} audio chunks, total size: {len(buffer)} bytes")
-                            else:
-                                # Handle non-bytes response (JSON, text)
-                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Received non-bytes chunk during audio collection: {type(chunk).__name__}")
-                                if isinstance(chunk, str):
-                                    try:
-                                        json_data = json.loads(chunk)
-                                        if "message" in json_data or "text" in json_data:
-                                            content = json_data.get("message") or json_data.get("text", "")
-                                            if content and content.strip():
-                                                message_history.append({"role": "assistant", "content": content})
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent JSON Response during audio: '{content}'")
-                                                audio_state.agent_is_speaking = False
-                                                return content
+                        except Exception as e:
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: ERROR - Unexpected error during audio collection: {e}")
+                            audio_state.agent_is_speaking = False
+                            return None
+                        except asyncio.TimeoutError:
+                            silence_count += 1
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Silence detected ({silence_count}/{max_silence_count})")
+                            continue
+                        
+                        if isinstance(chunk, bytes):
+                            buffer += chunk
+                            chunk_count += 1
+                            silence_count = 0  # Reset silence counter
+                            if chunk_count % 10 == 0:  # Log every 10th chunk
+                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Received {chunk_count} audio chunks, total size: {len(buffer)} bytes")
+                        else:
+                            # Handle non-bytes response (JSON, text)
+                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Received non-bytes chunk during audio collection: {type(chunk).__name__}")
+                            if isinstance(chunk, str):
+                                try:
+                                    json_data = json.loads(chunk)
+                                    if "message" in json_data or "text" in json_data:
+                                        content = json_data.get("message") or json_data.get("text", "")
+                                        if content and content.strip():
+                                            message_history.append({"role": "assistant", "content": content})
+                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent JSON Response during audio: '{content}'")
+                                            audio_state.agent_is_speaking = False
+                                            return content
+                                    
+                                    # Handle Checkmate dialog messages (nested structure) during audio collection
+                                    if "data" in json_data and isinstance(json_data["data"], dict):
+                                        nested_data = json_data["data"]
+                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found nested data, keys: {list(nested_data.keys())}")
+                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Nested data content: {nested_data}")
                                         
-                                        # Handle Checkmate dialog messages (nested structure) during audio collection
-                                        if "data" in json_data and isinstance(json_data["data"], dict):
-                                            nested_data = json_data["data"]
-                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found nested data, keys: {list(nested_data.keys())}")
-                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Nested data content: {nested_data}")
+                                        # Check for double nesting (data.data.dialog) during audio collection
+                                        if "data" in nested_data and isinstance(nested_data["data"], dict):
+                                            double_nested = nested_data["data"]
+                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found double nested data, keys: {list(double_nested.keys())}")
+                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Double nested data content: {double_nested}")
                                             
-                                            # Check for double nesting (data.data.dialog) during audio collection
-                                            if "data" in nested_data and isinstance(nested_data["data"], dict):
-                                                double_nested = nested_data["data"]
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found double nested data, keys: {list(double_nested.keys())}")
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Double nested data content: {double_nested}")
-                                                
-                                                if "dialog" in double_nested and isinstance(double_nested["dialog"], list):
-                                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found dialog array in double nested data with {len(double_nested['dialog'])} items")
-                                                    # Look for the most recent AI message in the dialog
-                                                    for i, dialog_item in enumerate(reversed(double_nested["dialog"])):
-                                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item {i}: {dialog_item}")
-                                                        if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
-                                                            content = dialog_item["text"]
-                                                            chrysalis = dialog_item.get("chrysalis")
-                                                            if content and content.strip():
-                                                                message_history.append(
-                                                                    {
-                                                                        "role": "assistant",
-                                                                        "content": content,
-                                                                        "cart": (chrysalis.get("order") if chrysalis else None),
-                                                                    }
-                                                                )
-                                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response during audio: '{content}'")
-                                                                audio_state.agent_is_speaking = False
-                                                                return content
-                                                            else:
-                                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: AI dialog item has empty text")
-                                                        else:
-                                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}")
-                                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: INFO - Audio collection: Dialog found in double nested data but no AI messages with text")
-                                                else:
-                                                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in double nested data")
-                                            
-                                            if "dialog" in nested_data and isinstance(nested_data["dialog"], list):
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found dialog array with {len(nested_data['dialog'])} items")
+                                            if "dialog" in double_nested and isinstance(double_nested["dialog"], list):
+                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found dialog array in double nested data with {len(double_nested['dialog'])} items")
                                                 # Look for the most recent AI message in the dialog
-                                                for i, dialog_item in enumerate(reversed(nested_data["dialog"])):
+                                                for i, dialog_item in enumerate(reversed(double_nested["dialog"])):
                                                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item {i}: {dialog_item}")
                                                     if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
                                                         content = dialog_item["text"]
@@ -988,23 +987,46 @@ class CheckmateModelManager(ModelManager):
                                                         else:
                                                             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: AI dialog item has empty text")
                                                     else:
-                                                        self._print_and_log(
-                                                            f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}"
-                                                        )
+                                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}")
+                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: INFO - Audio collection: Dialog found in double nested data but no AI messages with text")
                                             else:
-                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in nested data")
+                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in double nested data")
+                                        
+                                        if "dialog" in nested_data and isinstance(nested_data["dialog"], list):
+                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Found dialog array with {len(nested_data['dialog'])} items")
+                                            # Look for the most recent AI message in the dialog
+                                            for i, dialog_item in enumerate(reversed(nested_data["dialog"])):
+                                                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item {i}: {dialog_item}")
+                                                if isinstance(dialog_item, dict) and dialog_item.get("who") == "AI" and "text" in dialog_item:
+                                                    content = dialog_item["text"]
+                                                    chrysalis = dialog_item.get("chrysalis")
+                                                    if content and content.strip():
+                                                        message_history.append(
+                                                            {
+                                                                "role": "assistant",
+                                                                "content": content,
+                                                                "cart": (chrysalis.get("order") if chrysalis else None),
+                                                            }
+                                                        )
+                                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Dialog Response during audio: '{content}'")
+                                                        audio_state.agent_is_speaking = False
+                                                        return content
+                                                    else:
+                                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: AI dialog item has empty text")
+                                                else:
+                                                    self._print_and_log(
+                                                        f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: Dialog item not AI or missing text: who={dialog_item.get('who') if isinstance(dialog_item, dict) else 'not dict'}, has_text={'text' in dialog_item if isinstance(dialog_item, dict) else False}"
+                                                    )
                                         else:
-                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No nested data structure found")
-                                    except json.JSONDecodeError:
-                                        if chunk.strip():
-                                            message_history.append({"role": "assistant", "content": chunk})
-                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Text Response during audio: '{chunk}'")
-                                            audio_state.agent_is_speaking = False
-                                            return chunk
-                        except asyncio.TimeoutError:
-                            silence_count += 1
-                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Silence detected ({silence_count}/{max_silence_count})")
-                            continue
+                                            self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No dialog array found in nested data")
+                                    else:
+                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: DEBUG - Audio collection: No nested data structure found")
+                                except json.JSONDecodeError:
+                                    if chunk.strip():
+                                        message_history.append({"role": "assistant", "content": chunk})
+                                        self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: SUCCESS - Agent Text Response during audio: '{chunk}'")
+                                        audio_state.agent_is_speaking = False
+                                        return chunk
 
                     audio_state.agent_is_speaking = False
                     self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] RECEIVE: Audio collection complete - {chunk_count} chunks, {len(buffer)} total bytes")
@@ -1113,19 +1135,6 @@ class CheckmateModelManager(ModelManager):
         self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Starting resource cleanup")
         
         try:
-            # Cancel keepalive task first
-            if self.keepalive_task and not self.keepalive_task.done():
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Cancelling keepalive task...")
-                try:
-                    self.keepalive_task.cancel()
-                    if not self.loop.is_closed():
-                        self.loop.run_until_complete(asyncio.gather(self.keepalive_task, return_exceptions=True))
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - Keepalive task cancelled")
-                except Exception as e:
-                    self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: WARNING - Error cancelling keepalive task: {e}")
-            else:
-                self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: No keepalive task to cancel")
-            
             if self.websocket:
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: Closing websocket connection...")
                 if not self.loop.is_closed():
@@ -1154,6 +1163,5 @@ class CheckmateModelManager(ModelManager):
                 self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: No event loop to close or already closed")
             
             self.websocket = None
-            self.keepalive_task = None
             self.loop = None
             self._print_and_log(f"[RUN:{self.run_id}][MODEL:{self.type}] CLEANUP: SUCCESS - All resources cleaned up")
